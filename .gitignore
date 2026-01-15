@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data (do NOT upload)
+train_datasets/
+test_datasets/
+train_datasets_emb/
+test_datasets_emb/
+
+# Large artifacts
+*.pkl
+*.npy
+*.npz
+
+# Temporary outputs
+_smoke_out/
+pred_tmp/
+outputs/
+
+# OS
+.DS_Store
