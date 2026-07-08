@@ -100,7 +100,7 @@ splits (train ∩ test), ensuring computational efficiency and robustness.
 ---
 
 ### 5) Blending (`blend_preds_model.py`)
-Used to combine predictions from two base models (embedding + index or k-mer + index).
+Used to combine predictions from two base models (embedding + index).
 The default strategy is an unweighted average.
 
 ---
