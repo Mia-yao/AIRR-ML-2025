@@ -1,107 +1,107 @@
-# AIRR-ML-25 Phase 2 Submission Code (Final, Predictor-Aligned)
+# AIRR-ML-25 
 
-This repository contains the complete codebase used in our AIRR-ML-25
-Phase-1. All methods are wrapped in a unified execution interface
-that strictly follows the official AIRR-ML-25 `predict-airr` code template.
+This repository contains the codebase used for the AIRR-ML-25 submission. All methods are wrapped in a unified execution interface that follows the official AIRR-ML-25 `predict-airr` code template, while each method can also be run directly from the command line for debugging, auditing, or reproducing individual model outputs.
 
 ---
 
 ## Directory Structure
 
-```
+```text
 submit_code/
 ├── Dockerfile
 ├── README.md
 │
-├── methods/                      # Individual modeling approaches
-│   ├── embedding_model.py        # Embedding-based repertoire model
-│   ├── index_model.py            # Repertoire index / diversity model
-│   ├── kmer_index_model.py       # k-mer–based repertoire model
-│   ├── public_TCR_model.py       # Public TCR clone model (Dataset 3)
-│   └── blend_preds_model.py      # Model ensembling / blending
+├── methods/
+│   ├── embedding_model.py        # Embedding histogram + repertoire-statistics ensemble
+│   ├── kmer_index_model.py       # k-mer / delete-1 motif logistic regression model
+│   └── public_TCR_model.py       # Public TCR Fisher-enrichment + logistic regression model
 │
-├── submission/                   # Unified AIRR-ML-25 interface
-│   ├── main.py                   # CLI entry point (python -m submission.main)
-│   ├── predictor.py              # ImmuneStatePredictor (method dispatch)
+├── submission/
+│   ├── main.py                   # CLI entry point: python -m submission.main
+│   ├── predictor.py              # ImmuneStatePredictor; dispatches method by dataset ID
 │   └── utils.py                  # Utility functions provided by organizers
 │
 ├── train_datasets/
 ├── test_datasets/
 ├── train_datasets_emb/
-└── test_datasets_emb/
+├── test_datasets_emb/
+└── resources/                    # Required external resources, if not mounted elsewhere
+    ├── 100k_kmean.pkl            # Precomputed embedding prototype centers
+    └── v_gene_trans.pkl          # Optional V-gene normalization map for embedding model
 ```
 
 ---
 
-## Dataset–Model Mapping (Exact)
+## Dataset–Model Mapping
 
-The modeling strategy is selected automatically in `submission/predictor.py` based
-on the **training dataset ID** parsed from the training directory name.
+The modeling strategy is selected automatically in `submission/predictor.py` based on the training dataset ID parsed from the training directory name.
 
-| Dataset ID | Strategy | Scripts Used |
-|-----------:|----------|--------------|
-| Dataset 1  | Embedding + Index + Blend | `embedding_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 2  | k-mer + Index + Blend | `kmer_index_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 3  | Public TCR clone model | `public_TCR_model.py` |
-| Dataset 4  | k-mer + Index + Blend | `kmer_index_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 5  | k-mer + Index + Blend | `kmer_index_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 6  | k-mer + Index + Blend | `kmer_index_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 7  | Embedding + Index + Blend | `embedding_model.py`, `index_model.py`, `blend_preds_model.py` |
-| Dataset 8  | Embedding + Index + Blend | `embedding_model.py`, `index_model.py`, `blend_preds_model.py` |
+| Dataset ID | Strategy | Script Used |
+|-----------:|----------|-------------|
+| Dataset 1 | Embedding histogram + repertoire-statistics ensemble | `methods/embedding_model.py` |
+| Dataset 2 | k-mer / delete-1 motif logistic regression | `methods/kmer_index_model.py` |
+| Dataset 3 | Public TCR Fisher-enrichment logistic regression | `methods/public_TCR_model.py` |
+| Dataset 4 | k-mer / delete-1 motif logistic regression | `methods/kmer_index_model.py` |
+| Dataset 5 | k-mer / delete-1 motif logistic regression | `methods/kmer_index_model.py` |
+| Dataset 6 | k-mer / delete-1 motif logistic regression | `methods/kmer_index_model.py` |
+| Dataset 7 | Embedding histogram + repertoire-statistics ensemble | `methods/embedding_model.py` |
+| Dataset 8 | Embedding histogram + repertoire-statistics ensemble | `methods/embedding_model.py` |
 
 ---
 
-## Method Descriptions
+## Method Summaries
 
 ### 1) Embedding Model (`embedding_model.py`)
-**Used for Datasets 1, 7, and 8**
 
-Each repertoire is represented as a weighted histogram over precomputed TCR embedding
-prototype centers. Clone counts (`templates`) are used as weights. A regularized
-logistic regression classifier is trained on the resulting representation.
+Used for Datasets 1, 7, and 8.
 
----
+This method represents each repertoire using two complementary feature sets. First, precomputed 64-dimensional TCR embeddings are assigned to their nearest centers from a precomputed k-means prototype set. For each prototype, two abundance bins are counted: an inner bin for distances `<0.25` and an outer bin for distances `0.25–0.5`. Template counts are log-transformed and used as weights when available, and counts are normalized per 10,000 to generate a repertoire-level embedding histogram. Second, repertoire-level summary statistics are computed directly from TSV files, including diversity, clonal expansion, CDR3 length distribution, convergence, and V/J/VJ usage entropy.
 
-### 2) Index Model (`index_model.py`)
-**Used in combination with other models for Datasets 1, 7, and 8**
+Elastic-net logistic regression models are trained separately on embedding histograms and repertoire statistics. Each feature set is trained across five random seeds. Within each seed, hyperparameters are selected by cross-validated AUC and then refit on all training samples. Test probabilities are averaged across seeds, and final predictions are computed as `0.7 × embedding probability + 0.3 × repertoire-statistics probability`. Important sequences are selected from the embedding model by combining cluster feature importance with TCR-level case-control prevalence odds ratio, followed by stability aggregation across seeds.
 
-This model extracts repertoire-level summary statistics (e.g., diversity, clonality,
-length distribution, and frequency-based features) directly from TSV files.
+Main artifacts:
 
----
-
-### 3) k-mer Index Model (`kmer_index_model.py`)
-**Used for Datasets 2, 4, 5, and 6**
-
-This model extracts k-mer / motif-style features from CDR3 amino acid sequences and
-aggregates them at the repertoire level.
-
-**Model artifact (important)**
-- `motif_lr_bundle.pkl`  ← **(used by `predictor.py`)**
+- `embedding_ensemble_bundle.pkl`
+- `embedding_ensemble_bundle_meta.json`
+- `train_dataset_<ID>_top50000TCR.csv`
 
 ---
 
-### 4) Public TCR Model (`public_TCR_model.py`)
-**Used exclusively for Dataset 3**
+### 2) k-mer Motif Model (`kmer_index_model.py`)
 
-This model identifies disease-associated public TCR clones defined by `(cdr3, v_gene)`
-pairs. Candidate clones are restricted to those observed in both training and test
-splits (train ∩ test), ensuring computational efficiency and robustness.
+Used for Datasets 2, 4, 5, and 6.
 
-**Pipeline**
-1. Generate candidate clones (`make-candidates`, intersect mode)
-2. Train public-clone logistic regression model
-3. Predict on test repertoires
+This method uses short CDR3 amino acid motifs to train a repertoire-level classifier. Overlapping contiguous amino acid k-mers of length 3–6 are extracted using a sliding window and counted separately in positive and negative repertoires. Motifs observed at least three times in positive samples are ranked by enrichment, defined as positive count divided by negative count plus one, and the top 200 enriched k-mers are selected. In parallel, delete-1 spaced signatures are generated by removing one amino acid from each CDR3 sequence, allowing similar CDR3 patterns with one amino acid insertion or deletion to be captured. These signatures are also ranked by enrichment against a sampled negative background, and the top 200 signatures are selected.
 
-**Model artifacts**
-- `dataset3_publictcr_bundle.pkl`
-- `strong_clones.tsv` (used as important sequences if present)
+Each TCR is scored by the number of enriched contiguous motifs and enriched spaced signatures it contains. Each repertoire is represented by two features: the mean of the top 50 TCR-level contiguous motif scores and the mean of the top 50 spaced-signature scores. A scikit-learn logistic regression model is trained on these two features. Important sequences are ranked by the fitted linear combination of TCR-level motif and spaced-signature scores.
+
+Main artifacts:
+
+- `motif_lr_bundle.pkl`
+- `motif_lr_bundle_meta.json`
+- `top_kmers.tsv`
+- `top_delete1_signatures.tsv`
+- `all_tcr_ranked_with_scores.tsv`
+- `train_dataset_<ID>_top50000.csv`
 
 ---
 
-### 5) Blending (`blend_preds_model.py`)
-Used to combine predictions from two base models (embedding + index).
-The default strategy is an unweighted average.
+### 3) Public TCR Model (`public_TCR_model.py`)
+
+Used exclusively for Dataset 3.
+
+This method is conceptually similar to the Emerson public-response baseline. TCR clones are defined by CDR3 amino acid sequence and V gene. Candidate clones are restricted to sequences observed in at least two positive-labeled training repertoires and at least one test repertoire. For each candidate clone, presence across positive and negative training repertoires is counted, one-sided Fisher’s exact tests are used to identify enrichment in positive repertoires, and odds ratios are computed with a 0.5 pseudocount correction.
+
+The top 1,000 candidate clones, ranked by odds ratio, positive-sample prevalence, and Fisher p-value, are used to construct a binary clone-presence feature matrix. A scikit-learn logistic regression model is trained on this matrix to predict the binary disease label. Prediction probabilities are obtained using `predict_proba`. Important sequences are ranked by Fisher’s exact test p-value, and the top 50,000 sequences are returned with J gene calls inferred from the most frequent matching training clone.
+
+Main artifacts:
+
+- `candidate_tcr.tsv`
+- `publictcr_fisher_lr_bundle.pkl`
+- `publictcr_fisher_lr_bundle_meta.json`
+- `candidate_fisher_assoc.tsv`
+- `top1000_lr_feature_clones.tsv`
+- `top50000_tcr.csv`
 
 ---
 
@@ -109,75 +109,158 @@ The default strategy is an unweighted average.
 
 ### `metadata.csv`
 
-Each dataset directory contains a `metadata.csv` file with columns:
+Each training dataset directory contains a `metadata.csv` file with columns:
 
 - `repertoire_id`
 - `filename`
-- `label_positive` (training only)
+- `label_positive`
 
 Example:
+
 ```csv
 repertoire_id,filename,label_positive
-44967b361684556629a8b61288daf20c,44967b361684556629a8b61288daf20c.tsv,True
+44967b361684556629a8b61288daf20c,44967b361684556629a8b61288daf20c.tsv.gz,True
 ```
+
+Test metadata files, when present, should contain at least:
+
+- `repertoire_id`
+- `filename`
 
 ### Sample TSV Files
 
-Each sample TSV file contains clone-level information, including:
-- `cdr3aa` or `junction_aa`
-- `v_gene` or `v_call`
-- `templates` (clone counts; defaults to 1 if missing)
+Each sample TSV file contains clone-level information. The scripts support common column aliases, but the expected columns are:
+
+- `junction_aa` or `cdr3aa`
+- `v_call` or `v_gene`
+- `j_call` when important-sequence output requires CDR3–V–J sequences
+- `templates` or `template`, optional; defaults to 1 when missing
 
 ---
 
-## Unified Execution Interface (Required)
+## Standalone Method Commands
 
-All methods are executed via the official AIRR-ML-25 unified interface:
+The following commands run each method directly. Replace `<ID>` with the dataset number.
+
+### A) Embedding model: Datasets 1, 7, and 8
 
 ```bash
-python3 -m submission.main \
-  --train_dir /path/to/train_dataset \
-  --test_dir  /path/to/test_dataset \
-  --out_dir   /path/to/output_dir \
-  --n_jobs 4 \
+
+TRAIN_DIR=train_datasets/train_dataset_${ID}
+TEST_DIR=test_datasets/test_dataset_${ID}
+TRAIN_EMB_DIR=train_datasets_emb/train_dataset_${ID}
+TEST_EMB_DIR=test_datasets_emb/test_dataset_${ID}
+OUT_DIR=results/train_dataset_${ID}/embedding
+PROTO_PKL=resources/100k_kmean.pkl
+V_GENE_TRANS=resources/v_gene_trans.pkl
+
+python3 methods/embedding_model.py train \
+  --metadata_csv ${TRAIN_DIR}/metadata.csv \
+  --tsv_dir ${TRAIN_DIR} \
+  --emb_dir ${TRAIN_EMB_DIR} \
+  --proto_pkl ${PROTO_PKL} \
+  --v_gene_trans_pkl ${V_GENE_TRANS} \
+  --out_dir ${OUT_DIR} \
+  --dataset_name ${ID} \
+  --top_tcr_csv ${OUT_DIR}/train_dataset_${ID}_top50000TCR.csv \
+  --dist_thresh 0.25 \
+  --outer_thresh 0.5 \
+  --embed_weight 0.7 \
+  --top_n_tcr 50000 \
+  --n_jobs_grid -1 \
+  --cv_splits 5 \
+  --device cpu
+
+python3 methods/embedding_model.py predict \
+  --model_bundle_pkl ${OUT_DIR}/embedding_ensemble_bundle.pkl \
+  --metadata_csv ${TEST_DIR}/metadata.csv \
+  --tsv_dir ${TEST_DIR} \
+  --emb_dir ${TEST_EMB_DIR} \
+  --dataset_name test_dataset_${ID} \
+  --out_csv ${OUT_DIR}/test_dataset_${ID}_prediction.csv \
   --device cpu
 ```
 
-### Output Files (per training dataset)
+### B) k-mer motif model: Datasets 2, 4, 5, and 6
 
-After execution, the output directory will contain:
+```bash
 
-- `<train_dataset_name>_test_predictions.tsv`
-- `<train_dataset_name>_important_sequences.tsv`
+TRAIN_DIR=train_datasets/train_dataset_${ID}
+TEST_DIR=test_datasets/test_dataset_${ID}
+OUT_DIR=results/train_dataset_${ID}/kmer
 
-Prediction files use the standard schema:
-```csv
-ID,dataset,label_positive_probability
+python3 methods/kmer_index_model.py train \
+  --metadata_csv ${TRAIN_DIR}/metadata.csv \
+  --tsv_dir ${TRAIN_DIR} \
+  --out_dir ${OUT_DIR} \
+  --dataset_name ${ID} \
+  --top_tcr_out_csv ${OUT_DIR}/train_dataset_${ID}_top50000.csv \
+  --ks 3 4 5 6 \
+  --top_kmer 200 \
+  --min_dis_kmer 3 \
+  --sig_k_list 1 \
+  --sig_min_len 5 \
+  --top_sig 200 \
+  --min_dis_sig 3 \
+  --non_max 20000 \
+  --top_n 50 \
+  --top_tcr 50000 \
+  --max_iter 100
+
+python3 methods/kmer_index_model.py predict \
+  --model_bundle_pkl ${OUT_DIR}/motif_lr_bundle.pkl \
+  --tsv_dir ${TEST_DIR} \
+  --dataset_name test_dataset_${ID} \
+  --out_csv ${OUT_DIR}/test_dataset_${ID}_prediction.csv
 ```
 
-If no explicit interpretability artifact is produced, a valid empty
-`important_sequences.tsv` file is generated to satisfy the template requirements.
+Optional: if the test directory includes a metadata file and exact metadata ordering is required, add:
 
----
+```bash
+  --metadata_csv ${TEST_DIR}/metadata.csv
+```
 
-## Generating the Final `submissions.csv`
+### C) Public TCR model: Dataset 3
 
-After running all train/test dataset pairs, the final submission file can be generated
-using the utility function provided by the organizers:
+```bash
 
-```python
-from submission.utils import concatenate_output_files
-concatenate_output_files(out_dir=results_dir)
+TRAIN_DIR=train_datasets/train_dataset_${ID}
+TEST_DIR=test_datasets/test_dataset_${ID}
+OUT_DIR=results/train_dataset_${ID}/public_tcr
+
+python3 methods/public_TCR_model.py make-candidates \
+  --train_meta ${TRAIN_DIR}/metadata.csv \
+  --train_dir ${TRAIN_DIR} \
+  --test_dir ${TEST_DIR} \
+  --out_tsv ${OUT_DIR}/candidate_tcr.tsv \
+  --min_train_pos_samples 2 \
+  --min_test_samples 1
+
+python3 methods/public_TCR_model.py train \
+  --train_meta ${TRAIN_DIR}/metadata.csv \
+  --train_dir ${TRAIN_DIR} \
+  --candidate_tcr_tsv ${OUT_DIR}/candidate_tcr.tsv \
+  --out_dir ${OUT_DIR} \
+  --top_feature_n 1000 \
+  --or_pseudocount 0.5 \
+  --max_iter 2000 \
+  --test_size 0.2 \
+  --split_seed 0 \
+  --dataset_name ${ID} \
+  --top_tcr_out_csv ${OUT_DIR}/top50000_tcr.csv \
+  --top_k 50000
+
+python3 methods/public_TCR_model.py predict \
+  --model_bundle_pkl ${OUT_DIR}/publictcr_fisher_lr_bundle.pkl \
+  --test_dir ${TEST_DIR} \
+  --dataset_name test_dataset_${ID} \
+  --out_csv ${OUT_DIR}/test_dataset_${ID}_prediction.csv
+```
+
+Optional: if the test directory includes a metadata file and exact metadata ordering is required, add:
+
+```bash
+  --test_meta ${TEST_DIR}/metadata.csv
 ```
 
 ---
-
-## Docker and Reproducibility
-
-- The entire codebase is containerized via Docker.
-- The Docker image supports direct execution of:
-  ```bash
-  python3 -m submission.main --train_dir ... --test_dir ... --out_dir ...
-  ```
-- Model artifacts (`*.pkl`) and intermediate files are saved for full auditability.
-- Random seeds are fixed where applicable.
