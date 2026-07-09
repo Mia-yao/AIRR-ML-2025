@@ -4,17 +4,22 @@
 """
 AIRR-ML-25 k-mer/motif (contiguous + delete-1 signatures) + LogisticRegression
 
-Input:
-  - metadata.csv
-  - a directory containing per-repertoire .tsv files
-  
-Output:
-  - model bundle pickle (contains learned motif sets + signature sets + trained LR)
-  - prediction csv (ID, dataset, label_positive_probability)
+- read train AIRR TSV(.gz) repertoires using CDR3 + V/J gene columns
+- train on all training repertoires, without a validation split by default
+- extract overlapping contiguous k-mers of length 3,4,5,6
+- select top 200 positive-enriched k-mers, requiring positive count >= 3
+- generate delete-1 signatures, length >= 5
+- select top 200 positive-enriched delete-1 signatures, requiring positive count >= 3
+- score each TCR by counts of selected k-mers/signatures
+- represent each repertoire by two features:
+      mean(top 50 motif_score), mean(top 50 spaced_sig_score)
+- train sklearn LogisticRegression on these two features
+- prediction probabilities are obtained by predict_proba
+- top-50k TCRs are ranked by fitted TCR-level linear score:
+      intercept + w_motif * motif_score + w_sig * spaced_sig_score
+  and grouped by unique (junction_aa, v_call, j_call) using max score.
 """
-
 import os
-import re
 import json
 import pickle
 import argparse
@@ -26,8 +31,6 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
-from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
@@ -40,17 +43,19 @@ def ensure_dir(p: str):
     if p and not os.path.exists(p):
         os.makedirs(p, exist_ok=True)
 
+
 def save_pickle(obj, path: str):
-    ensure_dir(os.path.dirname(path))
+    ensure_dir(os.path.dirname(path) or ".")
     with open(path, "wb") as f:
         pickle.dump(obj, f)
+
 
 def load_pickle(path: str):
     with open(path, "rb") as f:
         return pickle.load(f)
 
+
 def to_bool(x) -> bool:
-    # robust parsing for True/False/0/1/"true"/"false"
     if isinstance(x, bool):
         return x
     if isinstance(x, (int, np.integer)):
@@ -62,33 +67,109 @@ def to_bool(x) -> bool:
         return False
     raise ValueError(f"Cannot parse boolean from: {x}")
 
-def infer_sample_id(row: pd.Series) -> str:
-    if "repertoire_id" in row and pd.notna(row["repertoire_id"]):
-        return str(row["repertoire_id"])
-    fn = str(row["filename"])
-    return fn.replace(".tsv", "")
 
-def read_one_tsv(tsv_path: str) -> pd.DataFrame:
+def strip_tsv_suffix(filename: str) -> str:
+    fn = os.path.basename(str(filename))
+    if fn.endswith(".tsv.gz"):
+        return fn[:-7]
+    if fn.endswith(".tsv"):
+        return fn[:-4]
+    return os.path.splitext(fn)[0]
+
+
+def resolve_tsv_path(tsv_dir: str, filename_or_sample_id: str) -> str:
+    """Resolve a TSV path, accepting metadata filename or sample_id."""
+    x = str(filename_or_sample_id)
+    candidates = []
+
+    # If metadata gives a filename, try it directly.
+    candidates.append(os.path.join(tsv_dir, x))
+
+    sid = strip_tsv_suffix(x)
+    candidates.extend([
+        os.path.join(tsv_dir, f"{sid}.tsv.gz"),
+        os.path.join(tsv_dir, f"{sid}.tsv"),
+    ])
+
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError("Cannot find TSV. Tried: " + "; ".join(candidates))
+
+
+def detect_col(df: pd.DataFrame, candidates: List[str], what: str) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise ValueError(f"Cannot find {what} column. candidates={candidates}, got={list(df.columns)}")
+
+
+CDR3_COL_CANDIDATES = ["junction_aa", "cdr3aa", "cdr3", "CDR3b", "CDR3"]
+V_COL_CANDIDATES = ["v_call", "v_gene", "TRBV", "v"]
+J_COL_CANDIDATES = ["j_call", "Jgene", "TRBJ", "j"]
+
+
+def read_one_sample_tsv(tsv_path: str, sample_id: str, label_positive: Optional[bool] = None) -> pd.DataFrame:
     """
-    Read one repertoire tsv and return a DataFrame with at least column 'cdr3aa'.
-    Notebook logic: accept 'cdr3aa' or 'junction_aa'.
+    Notebook-equivalent reader:
+      - keep CDR3 as junction_aa
+      - keep v_call and j_call
+      - add cdr3aa duplicate for motif scoring
+      - optionally add label
     """
     df = pd.read_csv(tsv_path, sep="\t")
-    if "cdr3aa" in df.columns:
-        ccol = "cdr3aa"
-    elif "junction_aa" in df.columns:
-        ccol = "junction_aa"
-    else:
-        raise ValueError(f"{tsv_path}: cannot find 'cdr3aa' or 'junction_aa' column.")
-    out = df[[ccol]].rename(columns={ccol: "cdr3aa"}).copy()
-    # basic cleanup
-    out["cdr3aa"] = out["cdr3aa"].astype(str)
-    out = out[out["cdr3aa"].str.len() > 0].reset_index(drop=True)
-    return out
+    ccol = detect_col(df, CDR3_COL_CANDIDATES, "CDR3")
+    vcol = detect_col(df, V_COL_CANDIDATES, "V gene")
+    jcol = detect_col(df, J_COL_CANDIDATES, "J gene")
+
+    sub = df[[ccol, vcol, jcol]].copy()
+    sub.columns = ["junction_aa", "v_call", "j_call"]
+    sub = sub.dropna(subset=["junction_aa", "v_call", "j_call"]).copy()
+    sub["junction_aa"] = sub["junction_aa"].astype(str)
+    sub["v_call"] = sub["v_call"].astype(str)
+    sub["j_call"] = sub["j_call"].astype(str)
+    sub["cdr3aa"] = sub["junction_aa"]
+    sub["sample_id"] = str(sample_id)
+    if label_positive is not None:
+        sub["label"] = 1 if bool(label_positive) else 0
+    return sub
+
+
+def load_train_metadata(metadata_csv: str) -> pd.DataFrame:
+    meta = pd.read_csv(metadata_csv)
+    required = {"filename", "label_positive"}
+    missing = required - set(meta.columns)
+    if missing:
+        raise ValueError(f"metadata missing columns {missing}. Found={list(meta.columns)}")
+    meta = meta.copy()
+    # Notebook logic: sample_id comes from filename with .tsv.gz stripped.
+    meta["sample_id"] = meta["filename"].apply(strip_tsv_suffix).astype(str)
+    meta["label_positive"] = meta["label_positive"].apply(to_bool)
+    return meta
+
+
+def load_test_metadata(metadata_csv: str) -> pd.DataFrame:
+    meta = pd.read_csv(metadata_csv)
+    if "filename" not in meta.columns:
+        raise ValueError(f"test metadata must contain filename. Found={list(meta.columns)}")
+    meta = meta.copy()
+    meta["sample_id"] = meta["filename"].apply(strip_tsv_suffix).astype(str)
+    return meta
+
+
+def infer_train_dataset_name(dataset_name: Optional[str], tsv_dir: Optional[str] = None) -> str:
+    if dataset_name:
+        ds = str(dataset_name)
+        return ds if ds.startswith("train_dataset_") else f"train_dataset_{ds}"
+    if tsv_dir:
+        base = os.path.basename(os.path.normpath(tsv_dir))
+        if base.startswith("train_dataset_"):
+            return base
+    return "train_dataset"
 
 
 # -----------------------------
-# Motif logic (contiguous)
+# Motif logic: contiguous k-mers
 # -----------------------------
 
 def collect_kmer_motifs(df: pd.DataFrame, counter: Counter, ks=(3, 4, 5, 6)):
@@ -98,56 +179,57 @@ def collect_kmer_motifs(df: pd.DataFrame, counter: Counter, ks=(3, 4, 5, 6)):
             if L < k:
                 continue
             for i in range(L - k + 1):
-                counter[s[i:i+k]] += 1
+                counter[s[i:i + k]] += 1
+
 
 def pick_top_contiguous_motifs(
-    df_train_dis: pd.DataFrame,
-    df_train_non: pd.DataFrame,
-    top_k: int = 80,
-    min_dis_count: int = 3,
+    df_dis: pd.DataFrame,
+    df_non: pd.DataFrame,
+    top_kmer: int = 200,
+    min_dis_kmer: int = 3,
     ks=(3, 4, 5, 6),
-) -> Set[str]:
+) -> Tuple[Set[str], pd.DataFrame]:
     motif_dis = Counter()
     motif_non = Counter()
-    collect_kmer_motifs(df_train_dis, motif_dis, ks=ks)
-    collect_kmer_motifs(df_train_non, motif_non, ks=ks)
+    collect_kmer_motifs(df_dis, motif_dis, ks=ks)
+    collect_kmer_motifs(df_non, motif_non, ks=ks)
 
     rows = []
     for m, c1 in motif_dis.items():
-        if c1 < min_dis_count:
+        if c1 < min_dis_kmer:
             continue
-        c0 = motif_non.get(m, 0) + 1  # +1 to avoid division by zero
+        c0 = motif_non.get(m, 0) + 1
         enr = c1 / c0
         rows.append((m, c1, c0, enr))
 
-    if len(rows) == 0:
-        return set()
-
     df_kmer = pd.DataFrame(rows, columns=["motif", "count_dis", "count_non", "enr"])
-    df_kmer["k"] = df_kmer["motif"].str.len()
-    df_kmer = df_kmer.sort_values("enr", ascending=False)
-    return set(df_kmer.head(top_k)["motif"].tolist())
+    if len(df_kmer):
+        df_kmer["k"] = df_kmer["motif"].str.len()
+        df_kmer = df_kmer.sort_values("enr", ascending=False).reset_index(drop=True)
+    return set(df_kmer.head(top_kmer)["motif"].tolist()) if len(df_kmer) else set(), df_kmer
 
-def motif_score_seq_contig(seq: str, motif_set: Set[str], ks=(3,4,5,6)) -> int:
+
+def motif_score_seq_contig(seq: str, motif_set: Set[str], ks=(3, 4, 5, 6)) -> int:
     L = len(seq)
     score = 0
     for k in ks:
         if L < k:
             continue
         for i in range(L - k + 1):
-            if seq[i:i+k] in motif_set:
+            if seq[i:i + k] in motif_set:
                 score += 1
     return score
 
 
 # -----------------------------
-# Signature logic (delete-1)
+# Signature logic: delete-1 spaced signatures
 # -----------------------------
 
 def del_k_signatures(s: str, k: int):
     L = len(s)
     for rm in combinations(range(L), k):
         yield "".join(s[i] for i in range(L) if i not in rm)
+
 
 def all_signatures(s: str, k_list=(1,), min_len=5) -> List[str]:
     sigs = []
@@ -157,30 +239,29 @@ def all_signatures(s: str, k_list=(1,), min_len=5) -> List[str]:
                 sigs.append(t)
     return sigs
 
+
 def pick_top_signatures_delete1(
-    df_train_dis: pd.DataFrame,
-    df_train_non: pd.DataFrame,
-    top_sig: int = 80,
+    df_dis: pd.DataFrame,
+    df_non: pd.DataFrame,
+    top_sig: int = 200,
     non_max: int = 20000,
     min_dis_sig: int = 3,
     k_list=(1,),
-    min_len=5,
-) -> Set[str]:
+    min_len: int = 5,
+) -> Tuple[Set[str], pd.DataFrame]:
     sig_dis = Counter()
     sig_non = Counter()
 
-    # disease: all
-    for s in tqdm(df_train_dis["cdr3aa"].values, desc="train disease sig", leave=False):
+    for s in tqdm(df_dis["cdr3aa"].values, desc="disease signatures", leave=False):
         for sig in all_signatures(s, k_list=k_list, min_len=min_len):
             sig_dis[sig] += 1
 
-    # background: subsample for speed
-    if len(df_train_non) > non_max:
-        df_bg = df_train_non.sample(non_max, random_state=0)
+    if len(df_non) > non_max:
+        df_non_sig = df_non.sample(non_max, random_state=0)
     else:
-        df_bg = df_train_non
+        df_non_sig = df_non
 
-    for s in tqdm(df_bg["cdr3aa"].values, desc="train non-disease sig", leave=False):
+    for s in tqdm(df_non_sig["cdr3aa"].values, desc="background signatures", leave=False):
         for sig in all_signatures(s, k_list=k_list, min_len=min_len):
             sig_non[sig] += 1
 
@@ -192,32 +273,22 @@ def pick_top_signatures_delete1(
         enr = c1 / c0
         rows.append((sig, c1, c0, enr))
 
-    if len(rows) == 0:
-        return set()
-
     df_sig = pd.DataFrame(rows, columns=["sig", "count_dis", "count_non", "enr"])
-    df_sig = df_sig.sort_values("enr", ascending=False)
-    return set(df_sig.head(top_sig)["sig"].tolist())
+    if len(df_sig):
+        df_sig = df_sig.sort_values("enr", ascending=False).reset_index(drop=True)
+    return set(df_sig.head(top_sig)["sig"].tolist()) if len(df_sig) else set(), df_sig
 
-def spaced_sig_score(seq: str, sig_set: Set[str], k_list=(1,), min_len=5) -> int:
+
+def spaced_sig_score(seq: str, sig_set: Set[str], k_list=(1,), min_len: int = 5) -> int:
     sigs = all_signatures(seq, k_list=k_list, min_len=min_len)
     return sum(s in sig_set for s in sigs)
 
 
 # -----------------------------
-# Aggregation (Top-N mean per repertoire)
+# Aggregation and scoring
 # -----------------------------
 
-def build_sample_feature_df(
-    df_dis: pd.DataFrame,
-    df_non: pd.DataFrame,
-    top_n: int = 30
-) -> pd.DataFrame:
-    """
-    For each sample_id:
-      motif_topN = mean of top-N motif_score among its TCR rows
-      sig_topN   = mean of top-N spaced_sig_score among its TCR rows
-    """
+def build_sample_feature_df(df_dis: pd.DataFrame, df_non: pd.DataFrame, top_n: int = 50) -> pd.DataFrame:
     df_all = pd.concat([df_dis, df_non], ignore_index=True)
     disease_ids = set(df_dis["sample_id"].unique())
 
@@ -225,11 +296,75 @@ def build_sample_feature_df(
     for sid, sub in df_all.groupby("sample_id"):
         row = {"sample_id": sid}
         row["label"] = 1 if sid in disease_ids else 0
-        row["motif_topN"] = float(sub["motif_score"].nlargest(top_n).mean()) if len(sub) else 0.0
-        row["sig_topN"]   = float(sub["spaced_sig_score"].nlargest(top_n).mean()) if len(sub) else 0.0
+        row["motif_topN"] = sub["motif_score"].nlargest(top_n).mean()
+        row["sig_topN"] = sub["spaced_sig_score"].nlargest(top_n).mean()
         rows.append(row)
-
     return pd.DataFrame(rows)
+
+
+def build_sample_feature_df_test(df_all: pd.DataFrame, top_n: int = 50) -> pd.DataFrame:
+    rows = []
+    for sid, sub in df_all.groupby("sample_id"):
+        rows.append({
+            "sample_id": sid,
+            "motif_topN": sub["motif_score"].nlargest(top_n).mean(),
+            "sig_topN": sub["spaced_sig_score"].nlargest(top_n).mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def add_tcr_scores(
+    df: pd.DataFrame,
+    top_kmers: Set[str],
+    sig_seeds: Set[str],
+    ks=(3, 4, 5, 6),
+    sig_k_list=(1,),
+    sig_min_len: int = 5,
+) -> pd.DataFrame:
+    df = df.copy()
+    df["motif_score"] = df["cdr3aa"].apply(lambda s: motif_score_seq_contig(s, top_kmers, ks=ks))
+    df["spaced_sig_score"] = df["cdr3aa"].apply(
+        lambda s: spaced_sig_score(s, sig_seeds, k_list=sig_k_list, min_len=sig_min_len)
+    )
+    return df
+
+
+def make_top_tcr_submission(
+    df_all_scored: pd.DataFrame,
+    clf: LogisticRegression,
+    dataset_name: str,
+    top_tcr: int = 50000,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    w_motif = float(clf.coef_[0, 0])
+    w_sig = float(clf.coef_[0, 1])
+    b0 = float(clf.intercept_[0])
+
+    df = df_all_scored.copy()
+    df["logit_score"] = w_motif * df["motif_score"] + w_sig * df["spaced_sig_score"] + b0
+
+    group_cols = ["junction_aa", "v_call", "j_call"]
+    df_tcr = (
+        df.groupby(group_cols, as_index=False)
+          .agg(score=("logit_score", "max"), n_occ=("logit_score", "size"))
+          .sort_values("score", ascending=False)
+          .reset_index(drop=True)
+    )
+
+    df_top = df_tcr.head(top_tcr).copy().reset_index(drop=True)
+    ds = infer_train_dataset_name(dataset_name)
+    df_top["ID"] = [f"{ds}_seq_top_{i}" for i in range(1, len(df_top) + 1)]
+    df_top["dataset"] = ds
+    df_top["label_positive_probability"] = -999.0
+
+    df_submission = df_top[[
+        "ID",
+        "dataset",
+        "label_positive_probability",
+        "junction_aa",
+        "v_call",
+        "j_call",
+    ]]
+    return df_submission, df_tcr
 
 
 # -----------------------------
@@ -244,7 +379,7 @@ class MotifModelBundle:
     top_n: int
     sig_k_list: Tuple[int, ...]
     sig_min_len: int
-    lr_model: object  # sklearn model
+    lr_model: object
     train_meta: Dict
 
     def to_dict_meta(self):
@@ -254,109 +389,40 @@ class MotifModelBundle:
 
 
 # -----------------------------
-# Pipeline: build dataframe from metadata+tsvs
-# -----------------------------
-
-def load_all_cdr3_from_metadata(
-    metadata_csv: str,
-    tsv_dir: str,
-    split_train_val: bool = True,
-    val_frac: float = 0.1,
-    seed: int = 0,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      meta (with sample_id)
-      df_train_rows: columns [cdr3aa, sample_id, label]
-      df_val_rows:   columns [cdr3aa, sample_id, label]   (may be empty if split_train_val=False)
-    """
-    meta = pd.read_csv(metadata_csv)
-    required = {"repertoire_id", "filename", "label_positive"}
-    missing = required - set(meta.columns)
-    if missing:
-        raise ValueError(f"metadata missing columns {missing}. Found={list(meta.columns)}")
-
-    meta = meta.copy()
-    meta["label_positive"] = meta["label_positive"].apply(to_bool)
-    meta["sample_id"] = meta.apply(infer_sample_id, axis=1)
-
-    if split_train_val:
-        train_ids, val_ids = train_test_split(
-            meta["sample_id"].astype(str),
-            test_size=val_frac,
-            stratify=meta["label_positive"].astype(int),
-            random_state=seed,
-        )
-        train_ids, val_ids = set(train_ids), set(val_ids)
-    else:
-        train_ids, val_ids = set(meta["sample_id"].astype(str)), set()
-
-    all_train_rows = []
-    all_val_rows = []
-
-    for _, row in tqdm(meta.iterrows(), total=len(meta), desc="samples"):
-        sid = str(row["sample_id"])
-        fn = str(row["filename"])
-        lab = bool(row["label_positive"])
-        path = os.path.join(tsv_dir, fn)
-        if not os.path.isfile(path):
-            # also try sid.tsv fallback
-            alt = os.path.join(tsv_dir, f"{sid}.tsv")
-            if os.path.isfile(alt):
-                path = alt
-            else:
-                raise FileNotFoundError(f"Cannot find {path} (or {alt})")
-
-        df_s = read_one_tsv(path)
-        df_s["sample_id"] = sid
-        df_s["label"] = 1 if lab else 0
-
-        if sid in val_ids:
-            all_val_rows.append(df_s)
-        else:
-            all_train_rows.append(df_s)
-
-    df_train = pd.concat(all_train_rows, ignore_index=True) if len(all_train_rows) else pd.DataFrame(columns=["cdr3aa","sample_id","label"])
-    df_val   = pd.concat(all_val_rows,   ignore_index=True) if len(all_val_rows) else pd.DataFrame(columns=["cdr3aa","sample_id","label"])
-    return meta, df_train, df_val
-
-
-# -----------------------------
 # Commands
 # -----------------------------
 
 def cmd_train(args):
-    meta, df_train, df_val = load_all_cdr3_from_metadata(
-        metadata_csv=args.metadata_csv,
-        tsv_dir=args.tsv_dir,
-        split_train_val=True,
-        val_frac=args.val_frac,
-        seed=args.seed,
+    meta = load_train_metadata(args.metadata_csv)
+    print(f"[info] Total train samples: {len(meta)}")
+
+    all_rows = []
+    for row in tqdm(meta.itertuples(index=False), total=len(meta), desc="Loading train TSVs"):
+        sid = str(row.sample_id)
+        tsv_path = resolve_tsv_path(args.tsv_dir, row.filename)
+        all_rows.append(read_one_sample_tsv(tsv_path, sid, label_positive=bool(row.label_positive)))
+
+    df_all = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame(
+        columns=["junction_aa", "v_call", "j_call", "cdr3aa", "sample_id", "label"]
     )
+    df_dis = df_all[df_all["label"] == 1].copy()
+    df_non = df_all[df_all["label"] == 0].copy()
+    print(f"[info] Train TCR rows: disease={len(df_dis)} non-disease={len(df_non)}")
 
-    df_train_dis = df_train[df_train["label"] == 1].copy()
-    df_train_non = df_train[df_train["label"] == 0].copy()
-    df_val_dis   = df_val[df_val["label"] == 1].copy() if len(df_val) else df_val.copy()
-    df_val_non   = df_val[df_val["label"] == 0].copy() if len(df_val) else df_val.copy()
-
-    print(f"[info] Train TCR rows disease={len(df_train_dis)} non={len(df_train_non)}")
-    if len(df_val):
-        print(f"[info]   Val TCR rows disease={len(df_val_dis)} non={len(df_val_non)}")
-
-    # 1) contiguous motifs
-    top_kmers = pick_top_contiguous_motifs(
-        df_train_dis=df_train_dis,
-        df_train_non=df_train_non,
-        top_k=args.top_kmer,
-        min_dis_count=args.min_dis_kmer,
+    print("[info] Counting overlapping contiguous k-mers on all train TCRs ...")
+    top_kmers, df_kmer = pick_top_contiguous_motifs(
+        df_dis=df_dis,
+        df_non=df_non,
+        top_kmer=args.top_kmer,
+        min_dis_kmer=args.min_dis_kmer,
         ks=tuple(args.ks),
     )
     print(f"[info] Top contiguous motifs selected: {len(top_kmers)}")
 
-    # 2) delete-1 signatures
-    sig_seeds = pick_top_signatures_delete1(
-        df_train_dis=df_train_dis,
-        df_train_non=df_train_non,
+    print("[info] Building delete-1 signature counts on all train TCRs ...")
+    sig_seeds, df_sig = pick_top_signatures_delete1(
+        df_dis=df_dis,
+        df_non=df_non,
         top_sig=args.top_sig,
         non_max=args.non_max,
         min_dis_sig=args.min_dis_sig,
@@ -365,51 +431,33 @@ def cmd_train(args):
     )
     print(f"[info] Top delete-1 signatures selected: {len(sig_seeds)}")
 
-    # 3) compute per-TCR scores (train/val)
-    print("[info] Computing per-TCR motif_score and spaced_sig_score ...")
-    for df_ in (df_train_dis, df_train_non, df_val_dis, df_val_non):
-        if len(df_) == 0:
-            continue
-        df_["motif_score"] = df_["cdr3aa"].apply(lambda s: motif_score_seq_contig(s, top_kmers, ks=tuple(args.ks)))
-        df_["spaced_sig_score"] = df_["cdr3aa"].apply(lambda s: spaced_sig_score(s, sig_seeds, k_list=tuple(args.sig_k_list), min_len=args.sig_min_len))
-
-    # 4) aggregate to per-sample features
-    df_train_feat = build_sample_feature_df(df_train_dis, df_train_non, top_n=args.top_n)
-    X_train = df_train_feat[["motif_topN", "sig_topN"]].values
-    y_train = df_train_feat["label"].values
-
-    # 5) train LR
-    clf = LogisticRegression(
-        C=args.C,
-        class_weight="balanced" if args.class_weight_balanced else None,
-        max_iter=args.max_iter,
-        random_state=args.seed,
+    print("[info] Computing TCR-level motif_score and spaced_sig_score ...")
+    df_all_scored = add_tcr_scores(
+        df_all,
+        top_kmers=top_kmers,
+        sig_seeds=sig_seeds,
+        ks=tuple(args.ks),
+        sig_k_list=tuple(args.sig_k_list),
+        sig_min_len=args.sig_min_len,
     )
-    clf.fit(X_train, y_train)
+    df_dis_scored = df_all_scored[df_all_scored["label"] == 1].copy()
+    df_non_scored = df_all_scored[df_all_scored["label"] == 0].copy()
 
+    df_feat = build_sample_feature_df(df_dis_scored, df_non_scored, top_n=args.top_n)
+    X = df_feat[["motif_topN", "sig_topN"]].values
+    y = df_feat["label"].values
+    print(f"[info] Sample-level feature matrix: {X.shape}")
+
+    # Notebook-equivalent LR: LogisticRegression() with no class weighting or hyperparameter tuning.
+    clf = LogisticRegression(max_iter=args.max_iter)
+    clf.fit(X, y)
     print("[info] Learned LR coefficients:")
     print("  intercept:", clf.intercept_)
-    print("  w_motif, w_sig:", clf.coef_)
+    print("  w_motif_topN, w_sig_topN:", clf.coef_)
 
-    train_meta = {
-        "args": vars(args),
-        "n_train_samples": int(df_train_feat.shape[0]),
-        "n_train_tcr_rows_disease": int(len(df_train_dis)),
-        "n_train_tcr_rows_non": int(len(df_train_non)),
-    }
-
-    # 6) val AUC
-    if len(df_val):
-        df_val_feat = build_sample_feature_df(df_val_dis, df_val_non, top_n=args.top_n)
-        X_val = df_val_feat[["motif_topN", "sig_topN"]].values
-        y_val = df_val_feat["label"].values
-        p_val = clf.predict_proba(X_val)[:, 1]
-        auc = float(roc_auc_score(y_val, p_val))
-        train_meta["val_auc"] = auc
-        train_meta["n_val_samples"] = int(df_val_feat.shape[0])
-        print(f"[info] Validation AUC = {auc:.6f}")
-    else:
-        print("[info] No validation split (val is empty).")
+    train_prob = clf.predict_proba(X)[:, 1]
+    train_auc = float(roc_auc_score(y, train_prob)) if len(np.unique(y)) == 2 else float("nan")
+    print(f"[info] Training-set AUC = {train_auc:.6f}")
 
     bundle = MotifModelBundle(
         top_kmers=sorted(list(top_kmers)),
@@ -419,148 +467,142 @@ def cmd_train(args):
         sig_k_list=tuple(args.sig_k_list),
         sig_min_len=args.sig_min_len,
         lr_model=clf,
-        train_meta=train_meta,
+        train_meta={
+            "args": vars(args),
+            "n_train_samples": int(df_feat.shape[0]),
+            "n_train_tcr_rows": int(df_all.shape[0]),
+            "n_train_tcr_rows_disease": int(len(df_dis)),
+            "n_train_tcr_rows_non": int(len(df_non)),
+            "n_top_kmers": int(len(top_kmers)),
+            "n_top_signatures": int(len(sig_seeds)),
+            "train_auc": train_auc,
+        },
     )
 
-    # save
     ensure_dir(args.out_dir)
     model_path = os.path.join(args.out_dir, "motif_lr_bundle.pkl")
-    meta_path  = os.path.join(args.out_dir, "motif_lr_bundle_meta.json")
+    meta_path = os.path.join(args.out_dir, "motif_lr_bundle_meta.json")
+    kmer_path = os.path.join(args.out_dir, "top_kmers.tsv")
+    sig_path = os.path.join(args.out_dir, "top_delete1_signatures.tsv")
 
     save_pickle(bundle, model_path)
     with open(meta_path, "w") as f:
         json.dump(bundle.to_dict_meta(), f, indent=2)
+    df_kmer.to_csv(kmer_path, sep="\t", index=False)
+    df_sig.to_csv(sig_path, sep="\t", index=False)
+
+    ds = infer_train_dataset_name(args.dataset_name, args.tsv_dir)
+    top_tcr_out_csv = args.top_tcr_out_csv or os.path.join(args.out_dir, f"{ds}_top50000.csv")
+    df_top_submission, df_tcr_ranked = make_top_tcr_submission(
+        df_all_scored=df_all_scored,
+        clf=clf,
+        dataset_name=ds,
+        top_tcr=args.top_tcr,
+    )
+    ensure_dir(os.path.dirname(top_tcr_out_csv) or ".")
+    df_top_submission.to_csv(top_tcr_out_csv, index=False)
+    df_tcr_ranked.to_csv(os.path.join(args.out_dir, "all_tcr_ranked_with_scores.tsv"), sep="\t", index=False)
 
     print(f"[ok] Saved model bundle: {model_path}")
-    print(f"[ok] Saved meta json   : {meta_path}")
+    print(f"[ok] Saved model meta  : {meta_path}")
+    print(f"[ok] Saved top k-mers  : {kmer_path}")
+    print(f"[ok] Saved top sigs    : {sig_path}")
+    print(f"[ok] Saved top TCR CSV : {top_tcr_out_csv}")
 
 
-def build_features_for_directory(
-    tsv_dir: str,
-    file_list: List[str],
-    top_kmers: Set[str],
-    sig_seeds: Set[str],
-    ks=(3,4,5,6),
-    sig_k_list=(1,),
-    sig_min_len=5,
-    top_n=30,
-) -> pd.DataFrame:
-    """
-    Build per-sample features for a list of .tsv files (test or train without metadata).
-    sample_id inferred from filename stem.
-    """
-    rows = []
-    for fn in tqdm(file_list, desc="test samples"):
-        if not fn.endswith(".tsv"):
-            continue
-        sid = fn[:-4]
-        path = os.path.join(tsv_dir, fn)
-        df = read_one_tsv(path)
-        if len(df) == 0:
-            rows.append({"sample_id": sid, "motif_topN": 0.0, "sig_topN": 0.0})
-            continue
-
-        df["motif_score"] = df["cdr3aa"].apply(lambda s: motif_score_seq_contig(s, top_kmers, ks=ks))
-        df["spaced_sig_score"] = df["cdr3aa"].apply(lambda s: spaced_sig_score(s, sig_seeds, k_list=sig_k_list, min_len=sig_min_len))
-
-        feat = {
-            "sample_id": sid,
-            "motif_topN": float(df["motif_score"].nlargest(top_n).mean()),
-            "sig_topN":   float(df["spaced_sig_score"].nlargest(top_n).mean()),
-        }
-        rows.append(feat)
-    return pd.DataFrame(rows)
+def list_tsv_files(tsv_dir: str) -> List[str]:
+    return sorted([f for f in os.listdir(tsv_dir) if f.endswith(".tsv.gz") or f.endswith(".tsv")])
 
 
 def cmd_predict(args):
     bundle: MotifModelBundle = load_pickle(args.model_bundle_pkl)
     clf = bundle.lr_model
-
     top_kmers = set(bundle.top_kmers)
     sig_seeds = set(bundle.sig_seeds)
 
-    # If metadata is provided, use it (keeps exact IDs). Otherwise infer from filenames.
     if args.metadata_csv:
-        meta = pd.read_csv(args.metadata_csv)
-        if "filename" not in meta.columns:
-            raise ValueError("metadata_csv must contain column 'filename' for predict.")
-        meta = meta.copy()
-        meta["sample_id"] = meta["filename"].astype(str).str.replace(".tsv", "", regex=False)
-        file_list = meta["filename"].astype(str).tolist()
-        feat_df = build_features_for_directory(
-            tsv_dir=args.tsv_dir,
-            file_list=file_list,
-            top_kmers=top_kmers,
-            sig_seeds=sig_seeds,
-            ks=bundle.ks,
-            sig_k_list=bundle.sig_k_list,
-            sig_min_len=bundle.sig_min_len,
-            top_n=bundle.top_n,
-        )
-        # align to metadata order
-        feat_df = meta[["sample_id"]].merge(feat_df, on="sample_id", how="left").fillna(0.0)
+        meta = load_test_metadata(args.metadata_csv)
+        items = list(zip(meta["sample_id"].astype(str), meta["filename"].astype(str)))
     else:
-        file_list = sorted([f for f in os.listdir(args.tsv_dir) if f.endswith(".tsv")])
-        feat_df = build_features_for_directory(
-            tsv_dir=args.tsv_dir,
-            file_list=file_list,
-            top_kmers=top_kmers,
-            sig_seeds=sig_seeds,
-            ks=bundle.ks,
-            sig_k_list=bundle.sig_k_list,
-            sig_min_len=bundle.sig_min_len,
-            top_n=bundle.top_n,
-        )
+        files = list_tsv_files(args.tsv_dir)
+        items = [(strip_tsv_suffix(f), f) for f in files]
 
-    X = feat_df[["motif_topN", "sig_topN"]].values
-    prob = clf.predict_proba(X)[:, 1]
+    test_rows = []
+    for sid, fn in tqdm(items, desc="Loading test TSVs"):
+        tsv_path = resolve_tsv_path(args.tsv_dir, fn)
+        test_rows.append(read_one_sample_tsv(tsv_path, sid, label_positive=None))
+
+    df_test_all = pd.concat(test_rows, ignore_index=True) if test_rows else pd.DataFrame(
+        columns=["junction_aa", "v_call", "j_call", "cdr3aa", "sample_id"]
+    )
+    print(f"[info] Total test TCR rows: {len(df_test_all)}")
+
+    df_test_scored = add_tcr_scores(
+        df_test_all,
+        top_kmers=top_kmers,
+        sig_seeds=sig_seeds,
+        ks=bundle.ks,
+        sig_k_list=bundle.sig_k_list,
+        sig_min_len=bundle.sig_min_len,
+    )
+    df_test_feat = build_sample_feature_df_test(df_test_scored, top_n=bundle.top_n)
+
+    # Preserve metadata/file order and fill empty/missing samples with zeros.
+    order_df = pd.DataFrame({"sample_id": [sid for sid, _ in items]})
+    df_test_feat = order_df.merge(df_test_feat, on="sample_id", how="left")
+    df_test_feat[["motif_topN", "sig_topN"]] = df_test_feat[["motif_topN", "sig_topN"]].fillna(0.0)
+
+    X_test = df_test_feat[["motif_topN", "sig_topN"]].values
+    prob = clf.predict_proba(X_test)[:, 1]
 
     out = pd.DataFrame({
-        "ID": feat_df["sample_id"].astype(str),
+        "ID": df_test_feat["sample_id"].astype(str),
         "dataset": args.dataset_name,
         "label_positive_probability": prob.astype(float),
-    })
+    }).sort_values("ID").reset_index(drop=True)
 
     ensure_dir(os.path.dirname(args.out_csv) or ".")
     out.to_csv(args.out_csv, index=False)
     print(f"[ok] Wrote predictions: {args.out_csv} (n={len(out)})")
 
 
+# -----------------------------
+# CLI
+# -----------------------------
+
 def build_parser():
-    p = argparse.ArgumentParser("airrml25_kmer_motif_single.py")
+    p = argparse.ArgumentParser("airrml25_kmer_motif_exactlogic.py")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # train
     tr = sub.add_parser("train")
-    tr.add_argument("--metadata_csv", required=True, help="train metadata.csv with columns repertoire_id,filename,label_positive")
-    tr.add_argument("--tsv_dir", required=True, help="directory containing training .tsv files")
-    tr.add_argument("--out_dir", required=True, help="output directory for model bundle")
-    tr.add_argument("--seed", type=int, default=0)
-    tr.add_argument("--val_frac", type=float, default=0.1)
+    tr.add_argument("--metadata_csv", required=True, help="train metadata.csv with filename,label_positive")
+    tr.add_argument("--tsv_dir", required=True, help="directory containing training .tsv.gz or .tsv files")
+    tr.add_argument("--out_dir", required=True, help="output directory for model bundle and related files")
+    tr.add_argument("--dataset_name", default=None, help="e.g. 5 or train_dataset_5; used for top-TCR IDs")
+    tr.add_argument("--top_tcr_out_csv", default=None, help="optional output CSV for top-50k TCR submission")
 
-    tr.add_argument("--ks", type=int, nargs="+", default=[3,4,5,6], help="k sizes for contiguous motifs")
-    tr.add_argument("--top_kmer", type=int, default=80)
+    # Notebook defaults.
+    tr.add_argument("--ks", type=int, nargs="+", default=[3, 4, 5, 6])
+    tr.add_argument("--top_kmer", type=int, default=200)
     tr.add_argument("--min_dis_kmer", type=int, default=3)
-
-    tr.add_argument("--sig_k_list", type=int, nargs="+", default=[1], help="delete-k list for signatures (default delete-1)")
+    tr.add_argument("--sig_k_list", type=int, nargs="+", default=[1])
     tr.add_argument("--sig_min_len", type=int, default=5)
-    tr.add_argument("--top_sig", type=int, default=80)
+    tr.add_argument("--top_sig", type=int, default=200)
     tr.add_argument("--min_dis_sig", type=int, default=3)
     tr.add_argument("--non_max", type=int, default=20000)
+    tr.add_argument("--top_n", type=int, default=50, help="Top-N mean aggregation within each repertoire")
+    tr.add_argument("--top_tcr", type=int, default=50000)
 
-    tr.add_argument("--top_n", type=int, default=30, help="Top-N mean aggregation within each repertoire")
-    tr.add_argument("--C", type=float, default=1.0)
-    tr.add_argument("--class_weight_balanced", action="store_true")
-    tr.add_argument("--max_iter", type=int, default=2000)
+    # LogisticRegression() default max_iter is 100; exposed only for convergence control.
+    tr.add_argument("--max_iter", type=int, default=100)
     tr.set_defaults(func=cmd_train)
 
-    # predict
     pr = sub.add_parser("predict")
     pr.add_argument("--model_bundle_pkl", required=True)
-    pr.add_argument("--tsv_dir", required=True, help="directory containing test .tsv files")
+    pr.add_argument("--tsv_dir", required=True, help="directory containing test .tsv.gz or .tsv files")
     pr.add_argument("--out_csv", required=True)
-    pr.add_argument("--dataset_name", required=True, help="e.g., test_dataset_4")
-    pr.add_argument("--metadata_csv", default=None, help="optional test metadata.csv to preserve exact ordering/IDs")
+    pr.add_argument("--dataset_name", required=True, help="e.g. test_dataset_5")
+    pr.add_argument("--metadata_csv", default=None, help="optional test metadata.csv to preserve exact IDs/order")
     pr.set_defaults(func=cmd_predict)
 
     return p
